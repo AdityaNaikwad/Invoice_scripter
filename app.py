@@ -3,14 +3,14 @@ import json
 import re
 import os
 from pathlib import Path
-import openpyxl
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook, load_workbook # type: ignore
 from datetime import datetime
 import requests
 import fitz  # PyMuPDF
 from dotenv import load_dotenv
 import pandas as pd
 import io
+
 
 # ── Load API key from .env ───────────────────────────────────────────────────
 load_dotenv()
