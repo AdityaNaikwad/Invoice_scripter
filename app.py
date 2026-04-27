@@ -2,28 +2,18 @@ import streamlit as st
 import json
 import re
 import os
-from pathlib import Path
-from openpyxl import Workbook, load_workbook # type: ignore
-from datetime import datetime
-import requests
-import fitz  # PyMuPDF
-from dotenv import load_dotenv
-import pandas as pd
 import io
+from pathlib import Path
+import openpyxl
+from openpyxl import Workbook, load_workbook
+from datetime import datetime
+import pandas as pd
+from dotenv import load_dotenv
+import google.generativeai as genai
 
-
-# ── Load API key from .env ───────────────────────────────────────────────────
+# ── Load API key ──────────────────────────────────────────────────────────────
 load_dotenv()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY") or st.secrets.get("OPENROUTER_API_KEY")
-
-# ── Config ───────────────────────────────────────────────────────────────────
-OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-
-# Free models on OpenRouter — ordered by reliability
-FREE_MODELS = {
-    "hy3":  "tencent/hy3-preview:free",
-    "DeepSeek R1":                "deepseek/deepseek-r1:free",
-}
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or st.secrets.get("GEMINI_API_KEY", "")
 
 FIELDS = [
     "transaction_number",
@@ -44,6 +34,38 @@ FIELD_LABELS = {
     "cgst":                  "CGST",
     "sgst":                  "SGST",
 }
+
+PROMPT = """You are an invoice data extraction assistant.
+Extract the following fields from this invoice and return ONLY a valid JSON object — no markdown, no explanation.
+
+Fields:
+- transaction_number: invoice or bill number
+- transaction_date: date on the invoice (YYYY-MM-DD format if possible)
+- entity_name: vendor / supplier / company name
+- reason_of_transaction: description of goods or services
+- amount: total amount as a number only, no currency symbol
+- cgst: CGST tax amount as a number only (use 0 if not present)
+- sgst: SGST tax amount as a number only (use 0 if not present)
+
+Use empty string "" for any field not found.
+Return ONLY the JSON object, nothing else."""
+
+# ── Gemini extraction ─────────────────────────────────────────────────────────
+def extract_from_pdf(pdf_bytes: bytes) -> dict:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel("gemini-3.1-flash-lite-preview")
+
+    response = model.generate_content([
+        PROMPT,
+        {"mime_type": "application/pdf", "data": pdf_bytes},
+    ])
+
+    content = response.text.strip()
+    content = re.sub(r"```(?:json)?|```", "", content).strip()
+    match = re.search(r"\{.*\}", content, re.DOTALL)
+    if match:
+        content = match.group()
+    return json.loads(content)
 
 # ── Excel helpers ─────────────────────────────────────────────────────────────
 def init_workbook(wb):
@@ -89,74 +111,11 @@ def workbook_to_dataframe(wb):
         return pd.DataFrame()
     return pd.DataFrame(rows[1:], columns=rows[0])
 
-# ── PDF → text ────────────────────────────────────────────────────────────────
-def pdf_to_text(pdf_bytes):
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    return "\n\n".join(page.get_text() for page in doc)
-
-# ── OpenRouter extraction ─────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are an invoice data extraction assistant.
-Extract the following fields from the invoice text and return ONLY a valid JSON object — no markdown fences, no explanation, no extra text.
-
-Fields:
-- transaction_number: invoice or bill number
-- transaction_date: date on the invoice (YYYY-MM-DD format if possible)
-- entity_name: vendor / supplier / company name
-- reason_of_transaction: description of goods or services
-- amount: total amount as a number only, no currency symbol
-- cgst: CGST tax amount as a number only (use 0 if not present)
-- sgst: SGST tax amount as a number only (use 0 if not present)
-
-Use empty string "" for any field not found.
-Return ONLY the JSON object."""
-
-
-def call_openrouter(text, model_id):
-    if not OPENROUTER_API_KEY:
-        raise ValueError("OPENROUTER_API_KEY not set in .env file.")
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://invoice-extractor.app",
-        "X-Title": "Invoice Extractor",
-    }
-    payload = {
-        "model": model_id,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": f"Extract invoice data from the text below:\n\n{text[:6000]}"},
-        ],
-        "temperature": 0,
-        "max_tokens": 512,
-    }
-
-    resp = requests.post(OPENROUTER_API_URL, headers=headers, json=payload, timeout=60)
-
-    # Surface the actual API error message for easy debugging
-    if not resp.ok:
-        try:
-            err = resp.json()
-            msg = err.get("error", {}).get("message", resp.text)
-        except Exception:
-            msg = resp.text
-        raise requests.HTTPError(f"{resp.status_code} — {msg}", response=resp)
-
-    content = resp.json()["choices"][0]["message"]["content"]
-    # Strip markdown fences if model adds them despite instructions
-    content = re.sub(r"```(?:json)?|```", "", content).strip()
-    # Extract the first JSON object if model adds extra text
-    match = re.search(r"\{.*\}", content, re.DOTALL)
-    if match:
-        content = match.group()
-    return json.loads(content)
-
-
-# ── Streamlit UI ──────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Invoice Extractor", page_icon="🧾", layout="centered")
 
-if not OPENROUTER_API_KEY:
-    st.error("⚠️ OpenRouter API key not found. Add `OPENROUTER_API_KEY=sk-or-...` to your `.env` file and restart.", icon="🔑")
+if not GEMINI_API_KEY:
+    st.error("⚠️ Gemini API key not found. Add `GEMINI_API_KEY=...` to your `.env` file (local) or Streamlit secrets (cloud).", icon="🔑")
     st.stop()
 
 # Session state
@@ -164,27 +123,11 @@ for key, default in [("workbook", None), ("wb_name", None), ("extracted", None),
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Header ────────────────────────────────────────────────────────────────────
 st.title("🧾 Invoice Data Extractor")
-st.caption("Extract invoice fields from PDFs and save them to your Excel file.")
-
-# ── Model selector (sidebar) ──────────────────────────────────────────────────
-with st.sidebar:
-    st.header("⚙️ Settings")
-    selected_label = st.selectbox(
-        "AI Model",
-        options=list(FREE_MODELS.keys()),
-        index=0,
-        help="All models are free on OpenRouter. Try another if one fails.",
-    )
-    selected_model = FREE_MODELS[selected_label]
-    st.caption(f"`{selected_model}`")
-    st.divider()
-    st.caption("If you get a 400 error, switch to a different model above.")
+st.caption("Upload an invoice PDF → extract fields → save to your Excel file.")
 
 # ── STEP 1: Choose Excel file ─────────────────────────────────────────────────
 st.subheader("Step 1 · Choose your Excel file")
-
 tab_existing, tab_new = st.tabs(["📂 Open existing file", "✨ Create new file"])
 
 with tab_existing:
@@ -197,8 +140,7 @@ with tab_existing:
             st.session_state.wb_name = existing_file.name
             st.session_state.extracted = None
             st.session_state.saved = False
-            row_count = wb.active.max_row - 1
-            st.success(f"✅ Loaded **{existing_file.name}** — {row_count} existing row(s).")
+            st.success(f"✅ Loaded **{existing_file.name}** — {wb.active.max_row - 1} existing row(s).")
         except Exception as e:
             st.error(f"Could not open file: {e}")
 
@@ -234,28 +176,20 @@ else:
             st.session_state.extracted = None
             st.session_state.saved = False
 
-            with st.spinner("Reading PDF…"):
-                text = pdf_to_text(uploaded_pdf.read())
-
-            if len(text.strip()) < 50:
-                st.warning("This PDF looks image-based — extraction may be limited.")
-
-            with st.spinner(f"Extracting fields using {selected_label}…"):
+            with st.spinner("Parsing PDF and extracting data..."):
                 try:
-                    result = call_openrouter(text, selected_model)
+                    result = extract_from_pdf(uploaded_pdf.read())
                     st.session_state.extracted = result
                 except json.JSONDecodeError as e:
-                    st.error(f"Model returned invalid JSON: {e}. Try a different model from the sidebar.")
-                except requests.HTTPError as e:
-                    st.error(f"API error: {e}\n\n💡 Try switching the model in the sidebar.")
+                    st.error(f"Could not parse response as JSON: {e}")
                 except Exception as e:
-                    st.error(f"Something went wrong: {e}")
+                    st.error(f"Error: {e}")
 
     # ── STEP 3: Review & save ─────────────────────────────────────────────────
     if st.session_state.extracted:
         st.divider()
         st.subheader("Step 3 · Review & save")
-        st.caption("Check the fields below and correct anything before saving.")
+        st.caption("Check and correct any field before saving.")
 
         data = st.session_state.extracted
         edited = {}
